@@ -40,11 +40,12 @@ Call MiIO: {prefix}/<uri> <data>\n\
            {prefix}/home/device_list {quote}{{"getVirtualModel":false,"getHuamiDevices":1}}{quote}\n\n\
 Devs List: {prefix}list [name=full|name_keyword] [getVirtualModel=false|true] [getHuamiDevices=0|1]\n\
            {prefix}list Light true 0\n\n\
-MiIO Spec: {prefix}spec [model_keyword|type_urn] [format=text|python|json|lite]\n\
+MIoT Spec: {prefix}spec [model_keyword|type_urn] [format=text|python|json]\n\
            {prefix}spec\n\
            {prefix}spec speaker\n\
            {prefix}spec xiaomi.wifispeaker.lx04\n\
-           {prefix}spec urn:miot-spec-v2:device:speaker:0000A015:xiaomi-lx04:1\n\
+           {prefix}spec urn:miot-spec-v2:device:speaker:0000A015:xiaomi-lx04:1\n\n\
+MIoT Decode: {prefix}decode <ssecurity> <nonce> <data> [gzip]\n\
 '
 
 
@@ -65,6 +66,9 @@ async def miio_command(service: MiIOService, did, text, prefix='?'):
 
     if cmd == 'spec':
         return await service.miot_spec(argc > 0 and argv[0], argc > 1 and argv[1])
+
+    if cmd == 'decode':
+        return MiIOService.miot_decode(argv[0], argv[1], argv[2], argc > 3 and argv[3] == 'gzip')
 
     if not did or not cmd or cmd == '?' or cmd == '？' or cmd == 'help' or cmd == '-h' or cmd == '--help':
         return miio_command_help(did, prefix)

@@ -4,41 +4,12 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 from .miaccount import MiAccount
 
+_LOGGER = logging.getLogger(__package__)
+
 # REGIONS = ['cn', 'de', 'i2', 'ru', 'sg', 'us']
-
-
-def gen_nonce():
-    """Time based nonce."""
-    nonce = os.urandom(8) + int(time.time() / 60).to_bytes(4, 'big')
-    return base64.b64encode(nonce).decode()
-
-
-def gen_signed_nonce(ssecret, nonce):
-    """Nonce signed with ssecret."""
-    m = hashlib.sha256()
-    m.update(base64.b64decode(ssecret))
-    m.update(base64.b64decode(nonce))
-    return base64.b64encode(m.digest()).decode()
-
-
-def gen_signature(url, signed_nonce, nonce, data):
-    """Request signature based on url, signed_nonce, nonce and data."""
-    sign = '&'.join([url, signed_nonce, nonce, 'data=' + data])
-    signature = hmac.new(key=base64.b64decode(signed_nonce),
-                         msg=sign.encode(),
-                         digestmod=hashlib.sha256).digest()
-    return base64.b64encode(signature).decode()
-
-
-def sign_data(uri, data, ssecurity):
-    if not isinstance(data, str):
-        data = json.dumps(data)
-    nonce = gen_nonce()
-    signed_nonce = gen_signed_nonce(ssecurity, nonce)
-    signature = gen_signature(uri, signed_nonce, nonce, data)
-    return {'_nonce': nonce, 'data': data, 'signature': signature}
 
 
 class MiIOService:
@@ -50,7 +21,7 @@ class MiIOService:
     async def miio_request(self, uri, data):
         def prepare_data(token, cookies):
             cookies['PassportDeviceId'] = token['deviceId']
-            return sign_data(uri, data, token['xiaomiio'][0])
+            return MiIOService.sign_data(uri, data, token['xiaomiio'][0])
         headers = {'User-Agent': 'iOS-14.4-6.0.103-iPhone12,3--D7744744F7AF32F0544445285880DD63E47D9BE9-8816080-84A3F44E137B71AE-iPhone', 'x-xiaomi-protocal-flag-cli': 'PROTOCAL-HTTP2'}
         return (await self.account.mi_request('xiaomiio', self.server + uri, prepare_data, headers))['result']
 
@@ -86,46 +57,59 @@ class MiIOService:
         result = result['list']
         return result if name == 'full' else [{'name': i['name'], 'model': i['model'], 'did': i['did'], 'token': i['token']} for i in result if not name or name in i['name']]
 
-    async def miot_spec_dict(self):
-        import tempfile
-        specs_path = os.path.join(tempfile.gettempdir(), 'miservice_miot_specs.json')
-        if os.path.exists(specs_path):
+    async def miot_spec(self, type=None, format=None):
+        if not type or not type.startswith('urn'):
+            def get_spec(all):
+                if not type:
+                    return all
+                ret = {}
+                for m, t in all.items():
+                    if type == m:
+                        return {m: t}
+                    elif type in m:
+                        ret[m] = t
+                return ret
+            import tempfile
+            path = os.path.join(tempfile.gettempdir(), 'miservice_miot_specs.json')
             try:
-                with open(specs_path) as f:
-                    result = json.load(f)
-                    if result:
-                        return result
+                with open(path) as f:
+                    result = get_spec(json.load(f))
             except:
-                pass
+                result = None
+            if not result:
+                async with self.account.session.get('http://miot-spec.org/miot-spec-v2/instances?status=all') as r:
+                    all = {i['model']: i['type'] for i in (await r.json())['instances']}
+                    with open(path, 'w') as f:
+                        json.dump(all, f)
+                    result = get_spec(all)
+            if len(result) != 1:
+                return result
+            type = list(result.values())[0]
 
-        async with self.account.session.get('http://miot-spec.org/miot-spec-v2/instances?status=all') as r:
-            all = {i['model']: i['type'] for i in (await r.json())['instances']}
-            with open(specs_path, 'w') as f:
-                json.dump(all, f)
-        return all
-
-    async def miot_spec_data(self, urn, format=None):
-        url = 'http://miot-spec.org/miot-spec-v2/instance?type=' + urn
+        url = 'http://miot-spec.org/miot-spec-v2/instance?type=' + type
         async with self.account.session.get(url) as r:
-            data = await r.json()
-        if format == 'json':
-            return data
-        if format == 'lite':
-            return {s['description']: {'iid': s['iid']} | {(p['description'] + '=') if 'write' in p['access'] else p['description']: p['iid'] if 'read' in p['access'] else -p['iid'] for p in s.get('properties', [])} | {'@' + a['description']: a['iid'] for a in s.get('actions', [])} for s in data['services']}
-        else:
+            result = await r.json()
+
+        if format != 'json':
             STR_EXP = '%s%s = %s\n'
             STR_EXP2 = '%s%s = %s%s\n'
             STR_HEAD, STR_SRV, STR_PROP, STR_VALUE, STR_ACTION = ('from enum import IntEnum\n\n', 'SRV_', 'PROP_', 'class VALUE_{}(IntEnum):\n',
                                                                   'ACTION_') if format == 'python' else ('', '', '  ', '', '  ')
-            text = '# Generated by https://github.com/Yonsm/MiService\n\n' + STR_HEAD
-            for s in data['services']:
+            text = '# Generated by https://github.com/Yonsm/MiService\n# ' + url + '\n\n' + STR_HEAD
+            siids = {}
+            for s in result['services']:
+                siid = s['iid']
                 desc = s['description'].replace(' ', '_')
-                text += STR_EXP % (STR_SRV, desc, s['iid'])
+                text += STR_EXP % (STR_SRV, desc, siid)
+                piids = {}
                 for p in s.get('properties', []):
+                    piid = p['iid']
                     desc = p['description'].replace(' ', '_')
                     access = p['access']
+                    if 'read' in access:
+                        piids[piid] = desc
                     comment = ''.join([' #' + k for k, v in [(p['format'], 'string'), (''.join([a[0] for a in access]), 'r')] if k != v])
-                    text += STR_EXP2 % (STR_PROP, desc, p['iid'], comment)
+                    text += STR_EXP2 % (STR_PROP, desc, piid, comment)
                     if 'value-range' in p:
                         valuer = p['value-range']
                         length = min(3, len(valuer))
@@ -135,27 +119,49 @@ class MiIOService:
                     else:
                         continue
                     text += STR_VALUE.format(desc) + ''.join([STR_EXP % ('    ', k, v) for k, v in values.items()])
+                if piids:
+                    siids[siid] = piids
                 for a in s.get('actions', []):
                     desc = a['description'].replace(' ', '_')
                     comment = ''.join([f" #{io}={a[io]}" for io in ['in', 'out'] if a[io]])
                     text += STR_EXP2 % (STR_ACTION, desc, a['iid'], comment)
                 text += '\n'
-            return text
+            if format == 'python':
+                text += 'ALL_PROPS = ' + str(siids) + '\n'
+            result = text
+        return result
 
-    async def miot_spec_for_model(self, model, format=None):
-        all = await self.miot_spec_dict()
-        return await self.miot_spec_data(all[model], format) if model in all else None
+    @staticmethod
+    def miot_decode(ssecurity, nonce, data, gzip=False):
+        from Crypto.Cipher import ARC4
+        r = ARC4.new(base64.b64decode(MiIOService.sign_nonce(ssecurity, nonce)))
+        r.encrypt(bytes(1024))
+        decrypted = r.encrypt(base64.b64decode(data))
+        if gzip:
+            try:
+                from io import BytesIO
+                from gzip import GzipFile
+                compressed = BytesIO()
+                compressed.write(decrypted)
+                compressed.seek(0)
+                decrypted = GzipFile(fileobj=compressed, mode='rb').read()
+            except:
+                pass
+        return json.loads(decrypted.decode())
 
-    async def miot_spec(self, urn_or_model=None, format=None):
-        if not urn_or_model or not urn_or_model.startswith('urn'):
-            all = await self.miot_spec_dict()
-            if not urn_or_model:
-                return all
-            if urn_or_model in all:
-                urn_or_model = all[urn_or_model]
-            else:
-                items = {m: t for m, t in all.items() if urn_or_model in m}
-                if len(items) != 1:
-                    return items
-                urn_or_model = list(items.values())[0]
-        return await self.miot_spec_data(urn_or_model, format)
+    @staticmethod
+    def sign_nonce(ssecurity, nonce):
+        m = hashlib.sha256()
+        m.update(base64.b64decode(ssecurity))
+        m.update(base64.b64decode(nonce))
+        return base64.b64encode(m.digest()).decode()
+
+    @staticmethod
+    def sign_data(uri, data, ssecurity):
+        if not isinstance(data, str):
+            data = json.dumps(data)
+        nonce = base64.b64encode(os.urandom(8) + int(time.time() / 60).to_bytes(4, 'big')).decode()
+        snonce = MiIOService.sign_nonce(ssecurity, nonce)
+        msg = '&'.join([uri, snonce, nonce, 'data=' + data])
+        sign = hmac.new(key=base64.b64decode(snonce), msg=msg.encode(), digestmod=hashlib.sha256).digest()
+        return {'_nonce': nonce, 'data': data, 'signature': base64.b64encode(sign).decode()}
