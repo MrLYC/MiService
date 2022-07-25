@@ -16,7 +16,7 @@ from miservice import MiIOService
 from pprint import pprint
 
 from aioprometheus import REGISTRY, Gauge
-from aioprometheus.pusher import Pusher
+from aioprometheus.service import Service as PrometheusService
 
 MI_STATUS = Gauge(
     "mi_device_status",
@@ -117,7 +117,6 @@ class Device:
 class Context:
     devices: Dict[str, Dict[str, DeviceInfo]] = field(default_factory=dict)
     specs: Dict[str, SepcInfo] = field(default_factory=dict)
-    pusher: Optional[Pusher] = field(default=None)
 
     async def init_devices(self, service: MiIOService):
         result = await service.device_list()
@@ -269,15 +268,18 @@ async def collect_lumi_sensor(context: Context, service: MiIOService):
     )
 
 
-async def collect_mode(context: Context, service: MiIOService):
-    await collect_zhimi_airpurifier_ma4(context, service)
-    await collect_zhimi_airpurifier_m1(context, service)
-    await collect_magnet_sensor(context, service)
-    await collect_chuangmi_camera_v2(context, service)
-    await collect_chuangmi_plug_m1(context, service)
-    await collect_cgllc_motion(context, service)
-    await collect_lumi_sensor(context, service)
-    await context.pusher.replace(REGISTRY)
+async def collect_mode(context: Context, user_id: str, password: str, config: str):
+    async with ClientSession() as session:
+        account = MiAccount(session, user_id, password, config)
+        service = MiIOService(account)
+
+        await collect_zhimi_airpurifier_ma4(context, service)
+        await collect_zhimi_airpurifier_m1(context, service)
+        await collect_magnet_sensor(context, service)
+        await collect_chuangmi_camera_v2(context, service)
+        await collect_chuangmi_plug_m1(context, service)
+        await collect_cgllc_motion(context, service)
+        await collect_lumi_sensor(context, service)
 
 
 async def spec_mode(context: Context, service: MiIOService, model: str):
@@ -286,16 +288,29 @@ async def spec_mode(context: Context, service: MiIOService, model: str):
 
 
 async def main(args):
+    context = Context()
     async with ClientSession() as session:
-        context = Context(pusher=Pusher("mi_status", args.addr) if args.addr else None)
         account = MiAccount(session, args.user_id, args.password, args.config)
         service = MiIOService(account)
 
         await context.init_devices(service)
-        if args.spec is None:
-            await collect_mode(context, service)
-        else:
+        if args.spec is not None:
             await spec_mode(context, service, args.spec)
+            return
+
+    prom = PrometheusService()
+    await prom.start(addr=args.addr, port=args.port)
+    while True:
+        try:
+            await collect_mode(context, args.user_id, args.password, args.config)
+        except Exception as e:
+            print(e)
+        except KeyboardInterrupt:
+            break
+
+        await asyncio.sleep(args.interval)
+
+    await prom.stop()
 
 
 if __name__ == "__main__":
@@ -304,7 +319,9 @@ if __name__ == "__main__":
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose output")
     parser.add_argument("-u", "--user_id", help="user id")
     parser.add_argument("-p", "--password", help="password")
-    parser.add_argument("-a", "--addr", help="push gateway addr")
+    parser.add_argument("-a", "--addr", default="localhost", help="prometheus addr")
+    parser.add_argument("-P", "--port", default=8080, help="prometheus port")
+    parser.add_argument("-i", "--interval", default=60, help="collect interval")
     parser.add_argument("-s", "--spec", default=None, help="collect spec")
     parser.add_argument(
         "-c",
